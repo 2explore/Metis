@@ -128,10 +128,9 @@ def extract_content(msg):
         return fetch_web_content(msg.url)
 
 def fetch_web_content(url):
-    """增强版网页内容抓取"""
+    """增强版网页内容抓取（支持百度百家号）"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://mp.weixin.qq.com/',
         'Accept-Language': 'zh-CN,zh;q=0.9'
     }
     
@@ -139,13 +138,16 @@ def fetch_web_content(url):
         response = http.get(url, headers=headers, timeout=20)
         response.raise_for_status()
 
-        # 微信公众号专用解析
-        if 'mp.weixin.qq.com' in url:
+        # 百度百家号专用解析
+        if 'baijiahao.baidu.com' in url:
             tree = html.fromstring(response.text)
-            content_nodes = tree.xpath('//div[@id="js_content"]//text()')
+            # 提取正文内容
+            content_nodes = tree.xpath('//div[contains(@class,"article-content")]//text()')
+            if not content_nodes:
+                content_nodes = tree.xpath('//div[@id="article"]//text()')
             if content_nodes:
                 content = '\n'.join(content_nodes).strip()
-                logger.info(f"成功提取微信公众号正文（{len(content)}字符）")
+                logger.info(f"成功提取百度百家号正文（{len(content)}字符）")
                 return content[:3000]
 
         # 通用解析
@@ -159,7 +161,7 @@ def fetch_web_content(url):
         raise RuntimeError("内容获取失败，请检查链接有效性")
 
 def analyze_content(text):
-    """调用DeepSeek API（严格JSON模式）"""
+    """调用DeepSeek API（严格模式）"""
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
@@ -170,12 +172,12 @@ def analyze_content(text):
             {
                 "role": "system",
                 "content": (
-                    "请严格按以下格式输出JSON（仅使用英文双引号）：\n"
-                    "{\"score\": 1-100整数, \"analysis\": \"分析内容\", \"details\": [\"要点1\", \"要点2\"]}\n"
+                    "请严格按以下JSON格式输出（使用转义双引号）：\n"
+                    "{\\\"score\\\": 1-100整数, \\\"analysis\\\": \\\"分析内容\\\", \\\"details\\\": [\\\"要点1\\\", \\\"要点2\\\"]}\n"
                     "注意：\n"
-                    "1. 所有双引号必须转义（如：\\\"）\n"
-                    "2. 不要包含任何代码块标记\n"
-                    "3. 不要使用中文引号"
+                    "1. 不要包含任何代码块标记\n"
+                    "2. 不要使用中文引号\n"
+                    "3. 确保JSON语法正确"
                 )
             },
             {
@@ -208,15 +210,15 @@ def generate_reply(analysis):
         cleaned = re.sub(r'^[^{]*', '', cleaned)  # 移除开头的非JSON内容
         cleaned = re.sub(r'[^}]*$', '', cleaned)  # 移除结尾的非JSON内容
         
-        # 2. 替换所有中文符号和非法字符
+        # 2. 替换所有非法字符
         cleaned = re.sub(r'[“”]', '"', cleaned)  # 中文引号转英文
         cleaned = re.sub(r'[\u201c\u201d]', '"', cleaned)  # Unicode引号处理
         cleaned = re.sub(r'\\+', r'\\', cleaned)  # 标准化反斜杠
         
         # 3. 修复JSON格式
         cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)  # 修复末尾逗号
-        cleaned = re.sub(r'(?<!\\)"', r'\"', cleaned)  # 转义未处理引号
-        cleaned = re.sub(r'[\x00-\x1F]', '', cleaned)  # 移除控制字符
+        cleaned = re.sub(r'(?<!\\)"', r'\"', cleaned)     # 转义未处理引号
+        cleaned = re.sub(r'[\x00-\x1F]', '', cleaned)     # 移除控制字符
         
         logger.debug(f"最终清洗内容:\n{cleaned}")
         
