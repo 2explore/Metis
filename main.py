@@ -10,8 +10,6 @@ from wechatpy.utils import check_signature
 from wechatpy.exceptions import InvalidSignatureException
 from readability import Document
 from lxml import html
-from urllib3.util.retry import Retry
-from requests.adapters import HTTPAdapter
 
 # ==================== 初始化配置 ====================
 app = Flask(__name__)
@@ -31,16 +29,6 @@ for var in REQUIRED_ENV_VARS:
 
 WECHAT_TOKEN = os.getenv("WECHAT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-
-# 配置请求重试
-retry_strategy = Retry(
-    total=3,
-    backoff_factor=1,
-    status_forcelist=[500, 502, 503, 504]
-)
-adapter = HTTPAdapter(max_retries=retry_strategy)
-http = requests.Session()
-http.mount("https://", adapter)
 
 # ==================== 微信验证处理 ====================
 @app.route('/', methods=['GET', 'POST'])
@@ -82,31 +70,17 @@ def verify_wechat(req):
 def process_message(req):
     """处理用户消息"""
     try:
-        # 解析原始数据
         raw_data = req.data.decode('utf-8')
         logger.debug(f"原始请求数据:\n{raw_data}")
         
         msg = parse_message(raw_data)
         logger.info(f"解析消息类型: {msg.type} 内容摘要: {str(msg)[:200]}...")
 
-        # 内容提取逻辑
-        content = ""
-        if msg.type in ['text', 'link']:
-            content = extract_content(msg)
-            if not content or len(content) < 50:
-                return create_reply("未获取到有效内容").render()
-        else:
-            return create_reply("暂不支持此消息类型").render()
+        content = extract_content(msg)
+        if not content or len(content) < 50:
+            return create_reply("未获取到有效内容").render()
 
-        # 调用AI分析
-        try:
-            analysis = analyze_content(content[:3000])
-            logger.debug(f"原始分析结果:\n{analysis}")
-        except Exception as e:
-            logger.error(f"AI分析失败: {str(e)}")
-            return create_reply("分析服务暂时不可用").render()
-
-        # 生成回复
+        analysis = analyze_content(content[:3000])
         return generate_reply(analysis)
 
     except Exception as e:
@@ -114,54 +88,39 @@ def process_message(req):
         return create_reply("消息处理出错").render()
 
 def extract_content(msg):
-    """内容提取统一处理"""
+    """内容提取"""
     if msg.type == 'text':
         url_match = re.search(r'https?://\S+', msg.content)
-        if url_match:
-            url = url_match.group(0)
-            logger.info(f"检测到文本链接: {url}")
-            return fetch_web_content(url)
-        else:
-            return msg.content
+        return fetch_web_content(url_match.group(0)) if url_match else msg.content
     elif msg.type == 'link':
-        logger.info(f"解析链接消息: {msg.url}")
         return fetch_web_content(msg.url)
+    else:
+        return ""
 
 def fetch_web_content(url):
-    """增强版网页内容抓取（支持百度百家号）"""
+    """网页内容抓取"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept-Language': 'zh-CN,zh;q=0.9'
+        'Referer': 'https://mp.weixin.qq.com/'
     }
-    
     try:
-        response = http.get(url, headers=headers, timeout=20)
+        response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
 
-        # 百度百家号专用解析
+        # 百度百家号解析
         if 'baijiahao.baidu.com' in url:
             tree = html.fromstring(response.text)
-            # 提取正文内容
-            content_nodes = tree.xpath('//div[contains(@class,"article-content")]//text()')
-            if not content_nodes:
-                content_nodes = tree.xpath('//div[@id="article"]//text()')
-            if content_nodes:
-                content = '\n'.join(content_nodes).strip()
-                logger.info(f"成功提取百度百家号正文（{len(content)}字符）")
-                return content[:3000]
+            content_nodes = tree.xpath('//div[contains(@class,"article-content")]//text()') or tree.xpath('//div[@id="article"]//text()')
+            return '\n'.join(content_nodes).strip()[:3000]
 
         # 通用解析
-        doc = Document(response.text)
-        content = doc.summary()
-        logger.info(f"通用解析内容长度: {len(content)}")
-        return content[:3000]
-
+        return Document(response.text).summary()[:3000]
     except Exception as e:
         logger.error(f"网页抓取失败: {str(e)}")
-        raise RuntimeError("内容获取失败，请检查链接有效性")
+        raise
 
 def analyze_content(text):
-    """调用DeepSeek API（严格模式）"""
+    """调用DeepSeek API"""
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
@@ -171,89 +130,48 @@ def analyze_content(text):
         "messages": [
             {
                 "role": "system",
-                "content": (
-                    "请严格按以下JSON格式输出（使用转义双引号）：\n"
-                    "{\\\"score\\\": 1-100整数, \\\"analysis\\\": \\\"分析内容\\\", \\\"details\\\": [\\\"要点1\\\", \\\"要点2\\\"]}\n"
-                    "注意：\n"
-                    "1. 不要包含任何代码块标记\n"
-                    "2. 不要使用中文引号\n"
-                    "3. 确保JSON语法正确"
-                )
+                "content": "严格按JSON格式输出：{\"score\":1-100整数, \"analysis\":\"分析内容\", \"details\":[\"要点1\",\"要点2\"]}。使用转义双引号。"
             },
-            {
-                "role": "user",
-                "content": text
-            }
+            {"role": "user", "content": text}
         ]
     }
-    
     try:
-        response = http.post(
+        response = requests.post(
             "https://api.deepseek.com/v1/chat/completions",
             json=payload,
             headers=headers,
-            timeout=30
+            timeout=25
         )
         response.raise_for_status()
         return response.json()['choices'][0]['message']['content']
     except Exception as e:
         logger.error(f"API调用失败: {str(e)}")
-        raise RuntimeError("分析服务请求失败")
+        raise
 
 def generate_reply(analysis):
-    """终极JSON清洗方案"""
+    """生成回复"""
     try:
-        # 深度清洗步骤
-        cleaned = analysis.strip()
-        
-        # 1. 移除所有非JSON内容
-        cleaned = re.sub(r'^[^{]*', '', cleaned)  # 移除开头的非JSON内容
-        cleaned = re.sub(r'[^}]*$', '', cleaned)  # 移除结尾的非JSON内容
-        
-        # 2. 替换所有非法字符
-        cleaned = re.sub(r'[“”]', '"', cleaned)  # 中文引号转英文
-        cleaned = re.sub(r'[\u201c\u201d]', '"', cleaned)  # Unicode引号处理
-        cleaned = re.sub(r'\\+', r'\\', cleaned)  # 标准化反斜杠
-        
-        # 3. 修复JSON格式
-        cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)  # 修复末尾逗号
-        cleaned = re.sub(r'(?<!\\)"', r'\"', cleaned)     # 转义未处理引号
-        cleaned = re.sub(r'[\x00-\x1F]', '', cleaned)     # 移除控制字符
-        
-        logger.debug(f"最终清洗内容:\n{cleaned}")
-        
-        # 4. 严格解析
+        # 清洗JSON
+        cleaned = re.sub(r'[\u200b-\u200f]', '', analysis)  # 移除零宽空格
+        cleaned = re.sub(r'^[^{]*', '', cleaned)            # 移除开头无效字符
         data = json.loads(cleaned)
         
-        # 数据校验
-        if not all(k in data for k in ('score', 'analysis', 'details')):
-            raise ValueError("缺少必要字段")
-        if not isinstance(data['details'], list):
-            raise ValueError("details应为列表")
-
         # 构造回复
-        score = int(data['score'])
+        score = data['score']
         color = "00c853" if score >=85 else "ffd600" if score >=65 else "d50000"
-        
-        reply = create_reply([
-            {
-                'title': f"📊 可信度评分：{score}/100",
-                'description': f"{data['analysis']}\n\n🔍 关键点：\n• " + '\n• '.join(data['details']),
-                'picurl': f"https://fakeimg.pl/600x400/{color}/fff/?text={score}分"
-            }
-        ]).render()
-        
-        logger.debug(f"生成回复XML:\n{reply}")
-        return reply
-        
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON解析失败: {str(e)}\n原始内容:\n{analysis}\n清洗后内容:\n{cleaned}")
-        return create_reply("分析结果格式异常").render()
+        return create_reply([{
+            'title': f"📊 可信度评分：{score}/100",
+            'description': f"{data['analysis']}\n\n🔍 关键点：\n• " + '\n• '.join(data['details']),
+            'picurl': f"https://fakeimg.pl/600x400/{color}/fff/?text={score}分"
+        }]).render()
     except Exception as e:
         logger.error(f"回复生成失败: {str(e)}")
         return create_reply("生成回复时发生错误").render()
 
-# ==================== 启动服务 ====================
+# ==================== 健康检查接口 ====================
+@app.route('/health')
+def health_check():
+    return 'OK', 200
+
 if __name__ == '__main__':
-    port = int(os.getenv('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 80)))
