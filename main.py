@@ -93,7 +93,7 @@ def process_message(req):
         content = ""
         if msg.type in ['text', 'link']:
             content = extract_content(msg)
-            if not content:
+            if not content or len(content) < 50:
                 return create_reply("未获取到有效内容").render()
         else:
             return create_reply("暂不支持此消息类型").render()
@@ -115,20 +115,17 @@ def process_message(req):
 
 def extract_content(msg):
     """内容提取统一处理"""
-    content = ""
     if msg.type == 'text':
-        # 检测文本中的URL
         url_match = re.search(r'https?://\S+', msg.content)
         if url_match:
             url = url_match.group(0)
             logger.info(f"检测到文本链接: {url}")
-            content = fetch_web_content(url)
+            return fetch_web_content(url)
         else:
-            content = msg.content
+            return msg.content
     elif msg.type == 'link':
         logger.info(f"解析链接消息: {msg.url}")
-        content = fetch_web_content(msg.url)
-    return content
+        return fetch_web_content(msg.url)
 
 def fetch_web_content(url):
     """增强版网页内容抓取"""
@@ -139,7 +136,6 @@ def fetch_web_content(url):
     }
     
     try:
-        # 带重试的请求
         response = http.get(url, headers=headers, timeout=20)
         response.raise_for_status()
 
@@ -152,7 +148,7 @@ def fetch_web_content(url):
                 logger.info(f"成功提取微信公众号正文（{len(content)}字符）")
                 return content[:3000]
 
-        # 通用网页解析
+        # 通用解析
         doc = Document(response.text)
         content = doc.summary()
         logger.info(f"通用解析内容长度: {len(content)}")
@@ -163,7 +159,7 @@ def fetch_web_content(url):
         raise RuntimeError("内容获取失败，请检查链接有效性")
 
 def analyze_content(text):
-    """调用DeepSeek API（增强版）"""
+    """调用DeepSeek API（严格JSON模式）"""
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
@@ -173,7 +169,14 @@ def analyze_content(text):
         "messages": [
             {
                 "role": "system",
-                "content": "请严格按以下JSON格式输出：{'score':1-100数字, 'analysis':'分析文本', 'details':['要点1','要点2']}。确保双引号正确转义，不使用代码块标记。"
+                "content": (
+                    "请严格按以下格式输出JSON（仅使用英文双引号）：\n"
+                    "{\"score\": 1-100整数, \"analysis\": \"分析内容\", \"details\": [\"要点1\", \"要点2\"]}\n"
+                    "注意：\n"
+                    "1. 所有双引号必须转义（如：\\\"）\n"
+                    "2. 不要包含任何代码块标记\n"
+                    "3. 不要使用中文引号"
+                )
             },
             {
                 "role": "user",
@@ -187,7 +190,7 @@ def analyze_content(text):
             "https://api.deepseek.com/v1/chat/completions",
             json=payload,
             headers=headers,
-            timeout=30  # 增加超时时间
+            timeout=30
         )
         response.raise_for_status()
         return response.json()['choices'][0]['message']['content']
@@ -200,15 +203,24 @@ def generate_reply(analysis):
     try:
         # 深度清洗步骤
         cleaned = analysis.strip()
-        cleaned = re.sub(r'^```json|```$', '', cleaned)  # 移除代码块标记
-        cleaned = re.sub(r"'", '"', cleaned)            # 单引号转双引号
-        cleaned = re.sub(r'(?<!\\)"', r'\"', cleaned)   # 转义未处理的引号
-        cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned) # 修复末尾逗号
-        cleaned = re.sub(r'[\x00-\x1F]', '', cleaned)   # 移除控制字符
-        cleaned = re.sub(r'\\+', r'\\', cleaned)        # 标准化反斜杠
+        
+        # 1. 移除所有非JSON内容
+        cleaned = re.sub(r'^[^{]*', '', cleaned)  # 移除开头的非JSON内容
+        cleaned = re.sub(r'[^}]*$', '', cleaned)  # 移除结尾的非JSON内容
+        
+        # 2. 替换所有中文符号和非法字符
+        cleaned = re.sub(r'[“”]', '"', cleaned)  # 中文引号转英文
+        cleaned = re.sub(r'[\u201c\u201d]', '"', cleaned)  # Unicode引号处理
+        cleaned = re.sub(r'\\+', r'\\', cleaned)  # 标准化反斜杠
+        
+        # 3. 修复JSON格式
+        cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)  # 修复末尾逗号
+        cleaned = re.sub(r'(?<!\\)"', r'\"', cleaned)  # 转义未处理引号
+        cleaned = re.sub(r'[\x00-\x1F]', '', cleaned)  # 移除控制字符
         
         logger.debug(f"最终清洗内容:\n{cleaned}")
         
+        # 4. 严格解析
         data = json.loads(cleaned)
         
         # 数据校验
@@ -233,7 +245,7 @@ def generate_reply(analysis):
         return reply
         
     except json.JSONDecodeError as e:
-        logger.error(f"JSON解析失败: {str(e)}\n清洗后内容:\n{cleaned}")
+        logger.error(f"JSON解析失败: {str(e)}\n原始内容:\n{analysis}\n清洗后内容:\n{cleaned}")
         return create_reply("分析结果格式异常").render()
     except Exception as e:
         logger.error(f"回复生成失败: {str(e)}")
