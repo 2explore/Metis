@@ -1,6 +1,6 @@
 flask==2.0.3
-werkzeug==2.0.3
 requests==2.26.0
 wechatpy==2.0.0a26
 readability-lxml==0.8.1
 lxml==4.9.4
+python-dotenv==0.19.2  # 可选，用于本地开发
