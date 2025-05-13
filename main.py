@@ -8,7 +8,8 @@ from flask import Flask, request
 from wechatpy import parse_message, create_reply
 from wechatpy.utils import check_signature
 from wechatpy.exceptions import InvalidSignatureException
-from selectolax.parser import HTMLParser
+from readability import Document
+from lxml import html
 
 # ==================== 初始化配置 ====================
 app = Flask(__name__)
@@ -114,7 +115,7 @@ def process_message(req):
         return create_reply("消息处理出错").render()
 
 def fetch_web_content(url):
-    """增强版网页内容抓取"""
+    """增强版网页内容抓取（兼容微信公众号）"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Referer': 'https://mp.weixin.qq.com/',
@@ -123,37 +124,27 @@ def fetch_web_content(url):
     
     try:
         # 带重试的请求
-        for retry in range(2):
-            try:
-                response = requests.get(url, headers=headers, timeout=15)
-                response.raise_for_status()
+        for _ in range(2):
+            response = requests.get(url, headers=headers, timeout=15)
+            if response.status_code == 200:
                 break
-            except requests.exceptions.RequestException as e:
-                if retry == 1:
-                    raise
-                logger.warning(f"请求失败重试中... ({str(e)})")
         else:
-            raise RuntimeError("请求失败")
+            response.raise_for_status()
 
-        # 微信文章专用解析
-        tree = HTMLParser(response.text)
-        
-        # 方案1：微信官方文章结构
-        wechat_content = tree.css_first('#js_content')
-        if wechat_content:
-            text = wechat_content.text(separator='\n', strip=True)
-            return text
-        
-        # 方案2：通用正文提取
-        body = tree.body
-        if body:
-            # 移除无用标签
-            for tag in body.css('script, style, noscript, iframe, button'):
-                tag.decompose()
-            return body.text(separator='\n', strip=True)
-        
-        # 最终回退方案
-        return response.text[:3000]
+        # 微信公众号专用解析
+        if 'mp.weixin.qq.com' in url:
+            tree = html.fromstring(response.text)
+            content_nodes = tree.xpath('//div[@id="js_content"]//text()')
+            if content_nodes:
+                content = '\n'.join(content_nodes).strip()
+                logger.info(f"成功提取微信公众号正文（{len(content)}字符）")
+                return content[:3000]
+
+        # 通用网页解析
+        doc = Document(response.text)
+        content = doc.summary()
+        logger.info(f"通用解析内容长度: {len(content)}")
+        return content[:3000]
 
     except Exception as e:
         logger.error(f"网页抓取失败: {str(e)}")
@@ -193,7 +184,7 @@ def analyze_content(text):
         raise RuntimeError("分析服务请求失败")
 
 def generate_reply(analysis):
-    """增强版回复生成"""
+    """增强版回复生成（兼容非标准JSON）"""
     try:
         # 深度清洗JSON
         cleaned = analysis.strip()
