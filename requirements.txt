@@ -1,9 +1,7 @@
 flask==2.0.3
 requests==2.28.2
 wechatpy==2.0.0a26
-readability-lxml==0.8.1
+selectolax==0.3.10
 lxml==4.9.4
 werkzeug==2.0.3
 urllib3==1.26.15
-chardet==4.0.0
-regex==2023.12.25
