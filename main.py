@@ -10,6 +10,8 @@ from wechatpy.utils import check_signature
 from wechatpy.exceptions import InvalidSignatureException
 from readability import Document
 from lxml import html
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
 # ==================== 初始化配置 ====================
 app = Flask(__name__)
@@ -29,6 +31,16 @@ for var in REQUIRED_ENV_VARS:
 
 WECHAT_TOKEN = os.getenv("WECHAT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+
+# 配置请求重试
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[500, 502, 503, 504]
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+http = requests.Session()
+http.mount("https://", adapter)
 
 # ==================== 微信验证处理 ====================
 @app.route('/', methods=['GET', 'POST'])
@@ -75,33 +87,20 @@ def process_message(req):
         logger.debug(f"原始请求数据:\n{raw_data}")
         
         msg = parse_message(raw_data)
-        logger.info(f"解析消息类型: {msg.type} 内容: {str(msg)[:200]}...")
+        logger.info(f"解析消息类型: {msg.type} 内容摘要: {str(msg)[:200]}...")
 
         # 内容提取逻辑
         content = ""
-        if msg.type == 'text':
-            # 检测文本中的URL
-            url_match = re.search(r'https?://\S+', msg.content)
-            if url_match:
-                url = url_match.group(0)
-                logger.info(f"检测到文本链接: {url}")
-                content = fetch_web_content(url)
-            else:
-                content = msg.content
-        elif msg.type == 'link':
-            logger.info(f"解析链接消息: {msg.url}")
-            content = fetch_web_content(msg.url)
+        if msg.type in ['text', 'link']:
+            content = extract_content(msg)
+            if not content:
+                return create_reply("未获取到有效内容").render()
         else:
             return create_reply("暂不支持此消息类型").render()
 
-        # 内容有效性检查
-        if not content or len(content) < 50:
-            logger.warning("内容过短或无有效信息")
-            return create_reply("未获取到有效内容").render()
-
         # 调用AI分析
         try:
-            analysis = analyze_content(content[:3000])  # 限制长度
+            analysis = analyze_content(content[:3000])
             logger.debug(f"原始分析结果:\n{analysis}")
         except Exception as e:
             logger.error(f"AI分析失败: {str(e)}")
@@ -114,8 +113,25 @@ def process_message(req):
         logger.error(f"消息处理异常: {str(e)}", exc_info=True)
         return create_reply("消息处理出错").render()
 
+def extract_content(msg):
+    """内容提取统一处理"""
+    content = ""
+    if msg.type == 'text':
+        # 检测文本中的URL
+        url_match = re.search(r'https?://\S+', msg.content)
+        if url_match:
+            url = url_match.group(0)
+            logger.info(f"检测到文本链接: {url}")
+            content = fetch_web_content(url)
+        else:
+            content = msg.content
+    elif msg.type == 'link':
+        logger.info(f"解析链接消息: {msg.url}")
+        content = fetch_web_content(msg.url)
+    return content
+
 def fetch_web_content(url):
-    """增强版网页内容抓取（兼容微信公众号）"""
+    """增强版网页内容抓取"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Referer': 'https://mp.weixin.qq.com/',
@@ -124,12 +140,8 @@ def fetch_web_content(url):
     
     try:
         # 带重试的请求
-        for _ in range(2):
-            response = requests.get(url, headers=headers, timeout=15)
-            if response.status_code == 200:
-                break
-        else:
-            response.raise_for_status()
+        response = http.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
 
         # 微信公众号专用解析
         if 'mp.weixin.qq.com' in url:
@@ -151,7 +163,7 @@ def fetch_web_content(url):
         raise RuntimeError("内容获取失败，请检查链接有效性")
 
 def analyze_content(text):
-    """调用DeepSeek API"""
+    """调用DeepSeek API（增强版）"""
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
@@ -161,21 +173,21 @@ def analyze_content(text):
         "messages": [
             {
                 "role": "system",
-                "content": "请严格按JSON格式输出分析结果，字段包括：score(1-100数字)、analysis(分析文本)、details(分析要点列表)"
+                "content": "请严格按以下JSON格式输出：{'score':1-100数字, 'analysis':'分析文本', 'details':['要点1','要点2']}。确保双引号正确转义，不使用代码块标记。"
             },
             {
                 "role": "user",
-                "content": f"请分析以下内容：\n{text}"
+                "content": text
             }
         ]
     }
     
     try:
-        response = requests.post(
+        response = http.post(
             "https://api.deepseek.com/v1/chat/completions",
             json=payload,
             headers=headers,
-            timeout=20
+            timeout=30  # 增加超时时间
         )
         response.raise_for_status()
         return response.json()['choices'][0]['message']['content']
@@ -184,14 +196,18 @@ def analyze_content(text):
         raise RuntimeError("分析服务请求失败")
 
 def generate_reply(analysis):
-    """增强版回复生成（兼容非标准JSON）"""
+    """终极JSON清洗方案"""
     try:
-        # 深度清洗JSON
+        # 深度清洗步骤
         cleaned = analysis.strip()
-        cleaned = re.sub(r"'", '"', cleaned)  # 单引号转双引号
-        cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)  # 修复末尾逗号
-        cleaned = re.sub(r'(?<!\\)"', r'\"', cleaned)  # 转义未处理引号
-        cleaned = re.sub(r'[\x00-\x1F]', '', cleaned)  # 移除控制字符
+        cleaned = re.sub(r'^```json|```$', '', cleaned)  # 移除代码块标记
+        cleaned = re.sub(r"'", '"', cleaned)            # 单引号转双引号
+        cleaned = re.sub(r'(?<!\\)"', r'\"', cleaned)   # 转义未处理的引号
+        cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned) # 修复末尾逗号
+        cleaned = re.sub(r'[\x00-\x1F]', '', cleaned)   # 移除控制字符
+        cleaned = re.sub(r'\\+', r'\\', cleaned)        # 标准化反斜杠
+        
+        logger.debug(f"最终清洗内容:\n{cleaned}")
         
         data = json.loads(cleaned)
         
@@ -217,7 +233,7 @@ def generate_reply(analysis):
         return reply
         
     except json.JSONDecodeError as e:
-        logger.error(f"JSON解析失败: {str(e)}\n清洗后内容: {cleaned}")
+        logger.error(f"JSON解析失败: {str(e)}\n清洗后内容:\n{cleaned}")
         return create_reply("分析结果格式异常").render()
     except Exception as e:
         logger.error(f"回复生成失败: {str(e)}")
