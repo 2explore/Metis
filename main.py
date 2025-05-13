@@ -29,11 +29,9 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 @app.route('/', methods=['GET', 'POST'])
 def handle_wechat():
     """处理所有微信请求"""
-    # GET请求 - 微信服务器验证
     if request.method == 'GET':
         return verify_wechat(request)
     
-    # POST请求 - 处理用户消息
     try:
         return process_message(request)
     except Exception as e:
