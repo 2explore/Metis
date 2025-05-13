@@ -2,6 +2,7 @@
 import os
 import json
 import logging
+import re
 import requests
 from flask import Flask, request
 from wechatpy import parse_message, create_reply
@@ -73,9 +74,22 @@ def process_message(req):
         logger.info(f"\n===== 解析后的消息 =====\n{msg.__dict__}")
         
         # 处理消息内容
+        content = None
         if msg.type == 'text':
-            content = msg.content
-            logger.info(f"收到文本消息: {content[:200]}...")
+            # 增强URL检测逻辑
+            url_match = re.search(r'https?://\S+', msg.content)
+            if url_match:
+                target_url = url_match.group(0)
+                logger.info(f"检测到文本中的链接: {target_url}")
+                try:
+                    content = fetch_web_content(target_url)
+                    logger.info(f"网页内容摘要: {content[:200]}...")
+                except Exception as e:
+                    logger.error(f"网页解析失败: {str(e)}")
+                    return create_reply("无法解析该网页内容").render()
+            else:
+                content = msg.content
+                logger.info(f"收到文本消息: {content[:200]}...")
         elif msg.type == 'link':
             logger.info(f"尝试解析链接: {msg.url}")
             try:
@@ -86,6 +100,9 @@ def process_message(req):
                 return create_reply("无法解析该网页内容").render()
         else:
             return create_reply("暂不支持此类型消息").render()
+        
+        if not content:
+            return create_reply("未获取到有效内容").render()
         
         # 调用DeepSeek分析
         try:
@@ -102,13 +119,13 @@ def process_message(req):
         return create_reply("消息处理出错").render()
 
 def fetch_web_content(url):
-    """抓取网页正文（带重试机制）"""
+    """抓取网页正文（带User-Agent和重试机制）"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept-Language': 'zh-CN,zh;q=0.9'
     }
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         doc = Document(response.text)
         return doc.summary()
@@ -116,7 +133,7 @@ def fetch_web_content(url):
         raise RuntimeError(f"网页抓取失败: {str(e)}")
 
 def analyze_content(text):
-    """调用DeepSeek分析（带容错机制）"""
+    """调用DeepSeek分析（带严格JSON格式要求）"""
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json"
@@ -126,11 +143,11 @@ def analyze_content(text):
         "messages": [
             {
                 "role": "system",
-                "content": "请分析新闻真实性，返回严格JSON格式：{'score':1-100, 'analysis':'分析内容','details':['要点1','要点2','要点3']}"
+                "content": "请严格按以下JSON格式输出分析结果：{'score':1-100数字, 'analysis':'分析文本', 'details':['要点1','要点2','要点3']}"
             },
             {
                 "role": "user",
-                "content": text[:3000]  # 限制输入长度
+                "content": text[:3000]
             }
         ]
     }
@@ -139,7 +156,7 @@ def analyze_content(text):
             "https://api.deepseek.com/v1/chat/completions",
             json=payload,
             headers=headers,
-            timeout=15
+            timeout=20
         )
         response.raise_for_status()
         return response.json()['choices'][0]['message']['content']
@@ -147,11 +164,21 @@ def analyze_content(text):
         raise RuntimeError(f"API调用失败: {str(e)}")
 
 def generate_reply(analysis):
-    """生成微信回复（安全JSON解析）"""
+    """生成微信回复（带严格JSON清洗）"""
     try:
-        data = json.loads(analysis.strip())
+        # 清理Markdown代码块
+        cleaned = re.sub(r'```json|```', '', analysis).strip()
+        # 修复常见JSON格式错误
+        cleaned = re.sub(r',\s*]', ']', cleaned)  # 修复末尾逗号
+        cleaned = re.sub(r',\s*}', '}', cleaned)
+        
+        data = json.loads(cleaned)
         if not all(key in data for key in ('score', 'analysis', 'details')):
             raise ValueError("返回JSON字段缺失")
+        
+        # 验证数据类型
+        if not isinstance(data['score'], int) or not (1 <= data['score'] <= 100):
+            raise ValueError("score值无效")
         
         score = data['score']
         color = "00c853" if score >=85 else "ffd600" if score >=65 else "d50000"
@@ -169,7 +196,7 @@ def generate_reply(analysis):
         return create_reply(articles).render()
     
     except json.JSONDecodeError as e:
-        logger.error(f"JSON解析失败: {str(e)}\n原始内容: {analysis}")
+        logger.error(f"JSON解析失败: {str(e)}\n清理后内容: {cleaned}")
         return create_reply("分析结果格式异常").render()
     except Exception as e:
         logger.error(f"回复生成失败: {str(e)}")
